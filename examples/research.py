@@ -5,7 +5,7 @@
 The brain is any OpenAI-compatible chat model with tool calling (AGENT_MODEL on
 TEXT_MODEL_BASE_URL). It gets three read-only tools:
 
-  search(query)        DuckDuckGo results (titles + links), read in the browser
+  search(query)        SearXNG results (title, url, snippet); set SEARXNG_URL
   open_page(url)       visible text and links of one page
   navigate(url, goal)  jev-ultrafast drives the page toward a narrow goal (forms,
                        filters, "load more"), then returns the page it ended on
@@ -17,7 +17,6 @@ import json
 import os
 import sys
 import time
-import urllib.parse
 
 import httpx
 
@@ -48,7 +47,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "search",
-            "description": "Web search. Returns result titles and links.",
+            "description": "Web search. Returns result titles, URLs and snippets.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string"}},
@@ -102,15 +101,21 @@ def open_page(url, links_only=False):
 
 
 def search(query):
-    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
-    result = open_page(url, links_only=True)
-    # DuckDuckGo wraps result links in a redirect; unwrap to the real URL.
-    for link in result["links"]:
-        target = urllib.parse.parse_qs(urllib.parse.urlparse(link["href"]).query).get("uddg")
-        if target:
-            link["href"] = target[0]
-    result["links"] = [link for link in result["links"] if "duckduckgo.com" not in link["href"]]
-    return result
+    # A SearXNG instance's JSON API. Search engines' own HTML pages show automated browsers a CAPTCHA.
+    response = httpx.get(
+        os.environ.get("SEARXNG_URL", "http://localhost:8080").rstrip("/") + "/search",
+        params={"q": query, "format": "json"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    results = response.json().get("results", [])[:10]
+    return {
+        "query": query,
+        "results": [
+            {"title": r.get("title", ""), "url": r.get("url", ""), "snippet": (r.get("content") or "")[:300]}
+            for r in results
+        ],
+    }
 
 
 def navigate(url, goal):
