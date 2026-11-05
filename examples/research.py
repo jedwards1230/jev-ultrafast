@@ -15,6 +15,7 @@ Pages are untrusted. The agent never logs in, buys, posts, or submits personal d
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -24,7 +25,7 @@ from jev_ultrafast import Agent
 from jev_ultrafast.browser import Browser
 
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "12"))
-MAX_TEXT = int(os.environ.get("AGENT_PAGE_CHARS", "3000"))
+MAX_TEXT = int(os.environ.get("AGENT_PAGE_CHARS", "6000"))
 MAX_LINKS = 25
 # Older tool results are cut to this many characters so a small context window holds the whole run.
 OLD_RESULT_CHARS = 400
@@ -88,7 +89,9 @@ def read(browser, links_only=False):
     links = (browser.evaluate(LINKS) or [])[:MAX_LINKS]
     result = {"url": page["url"], "title": page["title"], "links": links}
     if not links_only:
-        result["text"] = page["text"][:MAX_TEXT]
+        # The whole document, not jev's viewport-only snapshot: answers often sit below the fold.
+        text = browser.evaluate("document.body ? document.body.innerText : ''") or page["text"]
+        result["text"] = re.sub(r"\n\s*\n+", "\n", text).strip()[:MAX_TEXT]
     return result
 
 

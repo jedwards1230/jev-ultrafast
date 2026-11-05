@@ -62,7 +62,8 @@ TASKS = [
      [r"0\.1\.13"]),
     ("ollama-stable", False,
      "What is the latest stable (not pre-release) version of Ollama on GitHub, and on what date was it released?",
-     [r"0\.40\.14", r"(nov(ember)?\.? 3\b|2026-11-03|\b3 nov)"]),
+     # Published 2026-11-03 01:40 UTC, which GitHub shows as Nov 2 in US time zones: accept both.
+     [r"0\.40\.14", r"(nov(ember)?\.? [23]\b|2026-11-0[23]|\b[23] nov)"]),
     ("wiki-search-box", True,
      "Use the search box on https://en.wikipedia.org to open the article on Gödel's incompleteness theorems, "
      "and tell me the year Gödel published them.",
