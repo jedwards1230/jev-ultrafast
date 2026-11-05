@@ -22,7 +22,8 @@ def post_json(url, key, body):
             time.sleep(0.5 * 2**attempt)
             continue
         if response.is_error:
-            raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
+            detail = response.text[:300].replace(key, "<key>") if key else response.text[:300]
+            raise RuntimeError(f"Model provider returned HTTP {response.status_code}: {detail}; no action executed.")
         return response.json()
     raise RuntimeError("Model unavailable")
 
@@ -78,6 +79,39 @@ def action_space(actions):
     return elements, targets, controls
 
 
+# TypeSafe Jev accepts up to 255 options per choice question; Ollama's Clef accepts 26.
+MAX_CANDIDATES = int(os.environ.get("CHOICE_MAX_CANDIDATES", "255"))
+
+
+def candidate_groups(operation, candidates):
+    """Question name -> candidates, each group within 2..MAX_CANDIDATES. A lone candidate gets no question."""
+    items = list(candidates.items())
+    if len(items) < 2:
+        return {}
+    name = operation.lower() + "_target"
+    count = math.ceil(len(items) / MAX_CANDIDATES)
+    size = math.ceil(len(items) / count)  # even split, so no group is left with a single candidate
+    chunks = [dict(items[i : i + size]) for i in range(0, len(items), size)]
+    if len(chunks) == 1:
+        return {name: chunks[0]}
+    return {f"{name}_{n}": chunk for n, chunk in enumerate(chunks, 1)}
+
+
+def target_question(operation, candidates, goal):
+    return {
+        "type": "choice",
+        "criteria": {
+            index: {
+                "element": f"[{index}] {a['label']}",
+                "current_value": a.get("current_value", a.get("value", "")),
+                **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
+            }
+            for index, a in candidates.items()
+        },
+        "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
+    }
+
+
 def choose(state, goal, history):
     elements, targets, controls = action_space(state["actions"])
     labels = {
@@ -91,19 +125,11 @@ def choose(state, goal, history):
     questions = {
         "operation": {"type": "choice", "criteria": operations, "instructions": {"goal": goal, "rules": NEXT_ACTION}}
     }
+    groups = {}
     for operation, candidates in targets.items():
-        questions[operation.lower() + "_target"] = {
-            "type": "choice",
-            "criteria": {
-                index: {
-                    "element": f"[{index}] {a['label']}",
-                    "current_value": a.get("current_value", a.get("value", "")),
-                    **{k: a[k] for k in ("role", "checked", "selected", "expanded") if k in a},
-                }
-                for index, a in candidates.items()
-            },
-            "instructions": {"goal": goal, "operation": operation, "rules": [NEXT_ACTION, TARGET]},
-        }
+        groups[operation] = candidate_groups(operation, candidates)
+        for name, group in groups[operation].items():
+            questions[name] = target_question(operation, group, goal)
     body = {
         "model": os.environ.get("TYPESAFE_MODEL", "jev-latest"),
         "state": {
@@ -116,7 +142,9 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    # Any server speaking the System One API: TypeSafe (default), LiteLLM, or Ollama serving Clef.
+    base = os.environ.get("TYPESAFE_API_BASE", "https://api.typesafe.ai").rstrip("/")
+    result = post_json(base + "/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
@@ -124,10 +152,26 @@ def choose(state, goal, history):
     probabilities = {}
     if operation in targets:
         # Unused target heads cannot cause an action. Validate the head selected by the operation.
-        target_answer = validate_choice(result["answers"].get(operation.lower() + "_target", {}), targets[operation])
+        candidates, group_questions = targets[operation], groups[operation]
+        if not group_questions:  # a single candidate needs no question
+            only = next(iter(candidates))
+            target_answer = {"choice": only, "probabilities": {only: 1.0}, "confidence": 1.0}
+        elif len(group_questions) == 1:
+            ((name, group),) = group_questions.items()
+            target_answer = validate_choice(result["answers"].get(name, {}), group)
+        else:
+            # Candidates were split to fit the server's per-question limit: ask again among group winners.
+            winners = {}
+            for name, group in group_questions.items():
+                winner = validate_choice(result["answers"].get(name, {}), group)["choice"]
+                winners[winner] = candidates[winner]
+            name = operation.lower() + "_target"
+            final = {**body, "questions": {name: target_question(operation, winners, goal)}}
+            final_result = post_json(base + "/v1/systemone", os.environ["TYPESAFE_API_KEY"], final)
+            target_answer = validate_choice(final_result["answers"].get(name, {}), winners)
         target = target_answer["choice"]
-        choice = targets[operation][target]["id"]
-        probabilities = {a["id"]: target_answer["probabilities"][index] for index, a in targets[operation].items()}
+        choice = candidates[target]["id"]
+        probabilities = {a["id"]: target_answer["probabilities"].get(index, 0.0) for index, a in candidates.items()}
     else:
         choice = controls[operation]["id"] if operation in controls else operation
         probabilities[choice] = operation_answer["probabilities"][operation]
@@ -166,6 +210,9 @@ def field_text(context):
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
         reasoning = {"reasoning": {"enabled": False}}
+    # Servers differ on how to turn thinking off (Ollama: {"reasoning_effort": "none"}); this overrides the above.
+    if extra := os.environ.get("TEXT_MODEL_EXTRA_BODY"):
+        reasoning = json.loads(extra)
     started = time.perf_counter()
     result = post_json(
         base + "/chat/completions",

@@ -93,7 +93,33 @@ def test_all_heads_are_one_request_and_only_matching_head_executes(monkeypatch):
     d = model.choose(page(), "Find a book", [])
     assert len(calls) == 1
     assert d["operation"] == "TYPE_TEXT" and d["target"] == "1" and d["choice"] == "e1"
-    assert set(calls[0]["questions"]) == {"operation", "click_target", "type_text_target"}
+    # The lone text field needs no question (Clef rejects one-option questions); it is chosen directly.
+    assert set(calls[0]["questions"]) == {"operation", "click_target"}
+
+
+def test_large_candidate_sets_are_split_then_decided_among_winners(monkeypatch):
+    actions = [{"id": f"c{i}", "kind": "click", "label": f"Link {i}", "role": "link", "node": i} for i in range(60)]
+    state = {"url": "https://example.test/", "title": "Links", "text": "", "actions": actions}
+    calls = []
+
+    def post(_url, _key, body):
+        calls.append(body)
+        answers = {}
+        for name, question in body["questions"].items():
+            ids = list(question["criteria"])
+            answers[name] = choice(ids, "CLICK" if name == "operation" else ids[-1])
+        return {"model": "test", "answers": answers}
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test")
+    monkeypatch.setattr(model, "MAX_CANDIDATES", 26)
+    monkeypatch.setattr(model, "post_json", post)
+    d = model.choose(state, "Open the last link", [])
+    first, final = calls
+    groups = [q for name, q in first["questions"].items() if name.startswith("click_target_")]
+    assert len(groups) == 3 and all(2 <= len(q["criteria"]) <= 26 for q in groups)
+    assert sum(len(q["criteria"]) for q in groups) == 60
+    assert list(final["questions"]) == ["click_target"] and len(final["questions"]["click_target"]["criteria"]) == 3
+    assert d["choice"] == "c59"
 
 
 def test_click_cannot_consume_a_text_target(monkeypatch):
